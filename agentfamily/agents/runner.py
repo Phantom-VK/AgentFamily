@@ -1,114 +1,117 @@
+import asyncio
+import json
+import random
+
+from dotenv import load_dotenv
+from agents import ItemHelpers, Runner, set_tracing_disabled
+
+from agentfamily.agents.family import family_agents
+
+# ✅ Setup
+load_dotenv()
+set_tracing_disabled(True)
+
+TOPIC = "Discuss what to cook for dinner tonight."
 
 
-
-from __future__ import annotations
-
-import argparse
-import os
-
-from agents import RunHooks, Runner, set_tracing_disabled
-
-from agentfamily.agents.family import family_room_agent
-
-DEFAULT_TOPIC = "Discuss what to cook for dinner tonight."
-DEFAULT_TURNS = 6
-
-FAMILY_CHAT_RULES = """
-You are participating in a live family conversation.
-
-Conversation rules:
-- One family member should speak next.
-- If you are the family room router, hand off to the best family member.
-- Speak naturally to the other family members, not to the system.
-- Reply in 1 to 3 short sentences.
-- React to the latest message and keep the conversation moving.
-- Sound like a real family member talking at home.
-- Do not mention being an AI, an agent, a model, or a prompt.
-- Do not add a speaker label like "Mommy:" because the runner prints that already.
-""".strip()
-
-
-def configure_runtime() -> None:
-    if not os.getenv("OPENAI_API_KEY"):
-        set_tracing_disabled(True)
-
-
-def _format_transcript(transcript: list[tuple[str, str]]) -> str:
-    if not transcript:
-        return "No one has spoken yet."
-
-    return "\n".join(f"{speaker.title()}: {message}" for speaker, message in transcript)
-
-
-def _build_turn_input(
-    topic: str,
-    transcript: list[tuple[str, str]],
-) -> str:
+def build_input(topic: str, transcript: list[tuple[str, str]]) -> str:
     if transcript:
-        latest_speaker, latest_message = transcript[-1]
-        latest_line = f"The latest message was from {latest_speaker.title()}: {latest_message}"
+        last_speaker, last_message = transcript[-1]
+        latest_context = (
+            f"Last speaker: {last_speaker}\n"
+            f"Last message: {last_message}"
+        )
     else:
-        latest_line = "This is the first turn. Start the family conversation naturally."
+        latest_context = "Last speaker: None\nLast message: This is the start of the conversation."
 
     return f"""
-{FAMILY_CHAT_RULES}
+Simulate a natural family conversation.
 
-Topic:
-{topic}
+Topic: {topic}
 
-Conversation so far:
-{_format_transcript(transcript)}
+Recent context:
+{latest_context}
 
-{latest_line}
-Choose the best next family speaker and continue the conversation.
+Rules:
+- Speak naturally as a family member
+- Keep replies short
+- Use handoffs between members
+- End conversation by calling stop_conversation with a final decision
 """.strip()
 
 
-class FamilyConversationHooks(RunHooks):
-    async def on_handoff(self, from_agent, to_agent) -> None:
-        print(f"[handoff] {from_agent.name} -> {to_agent.name}")
+# ✅ Unified parser (handles both spoken + stop)
+def parse_output(output):
+    if isinstance(output, dict):
+        return output
+
+    if isinstance(output, str):
+        try:
+            return json.loads(output)
+        except:
+            return None
+
+    return None
 
 
-def simulate_family_chat(
-    topic: str = DEFAULT_TOPIC,
-    turns: int = DEFAULT_TURNS,
-) -> list[tuple[str, str]]:
-    configure_runtime()
-
+async def run_chat(topic: str = TOPIC):
+    starting_agent = random.choice(family_agents)
+    current_agent = starting_agent
     transcript: list[tuple[str, str]] = []
 
-    for _ in range(turns):
-        turn_input = _build_turn_input(topic, transcript)
-        result = Runner.run_sync(
-            family_room_agent,
-            turn_input,
-            hooks=FamilyConversationHooks(),
-        )
-        speaker = result.last_agent.name
-        message = str(result.final_output).strip()
-        transcript.append((speaker, message))
-        print(f"{speaker}: {message}")
+    print(f"Starting with: {current_agent.name}\n")
 
-    return transcript
+    final_decision = None
 
+    result = Runner.run_streamed(current_agent, build_input(topic, transcript))
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Simulate a family conversation.")
-    parser.add_argument(
-        "--topic",
-        default=DEFAULT_TOPIC,
-        help="Topic for the family to discuss.",
-    )
-    parser.add_argument(
-        "--turns",
-        type=int,
-        default=DEFAULT_TURNS,
-        help="How many family replies to simulate.",
-    )
-    args = parser.parse_args()
+    async for event in result.stream_events():
 
-    simulate_family_chat(topic=args.topic, turns=args.turns)
+        # 🔹 Handle agent switch
+        if event.type == "agent_updated_stream_event":
+            prev = current_agent.name
+            current_agent = event.new_agent
 
+            if prev != current_agent.name:
+                print(f"[handoff] {prev} -> {current_agent.name}")
 
-if __name__ == "__main__":
-    main()
+        # 🔹 Handle outputs
+        elif event.type == "run_item_stream_event":
+
+            if event.item.type == "message_output_item":
+                text = ItemHelpers.text_message_output(event.item).strip()
+                if text:
+                    print(f"{current_agent.name}: {text}")
+
+            elif event.item.type == "tool_call_output_item":
+                data = parse_output(event.item.output)
+
+                if not data:
+                    continue
+
+                # ✅ Spoken message
+                if data.get("status") == "spoken":
+                    msg = data.get("message", "").strip()
+                    if msg:
+                        transcript.append((current_agent.name, msg))
+                        print(f"{current_agent.name}: {msg}")
+
+                # ✅ Final decision
+                elif data.get("status") == "completed":
+                    final_decision = data.get("decision")
+                    break  # 🔥 stop immediately
+
+    # fallback
+    if not final_decision:
+        data = parse_output(result.final_output)
+        if data and data.get("status") == "completed":
+            final_decision = data.get("decision")
+
+    print("\n---")
+
+    if final_decision:
+        print(f"Decision: {final_decision}")
+    else:
+        print("No final decision reached.")
+
+    return final_decision
